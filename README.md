@@ -56,9 +56,10 @@ Requires the .NET 8 SDK.
 ```powershell
 git clone https://github.com/somanysteves/flashy-toast
 cd flashy-toast
-dotnet publish src/FlashyToast/FlashyToast.csproj -c Release -r win-x64 -p:PublishSingleFile=true --self-contained true
-# exe lands in src\FlashyToast\bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\flashy-toast.exe
+./build.ps1
 ```
+
+CI runs the same script (`.github/workflows/build.yml`, `.github/workflows/release.yml`).
 
 ## How it works
 
