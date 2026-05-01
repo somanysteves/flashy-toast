@@ -10,6 +10,53 @@ internal static class WindowResolver
 
     public sealed record Candidate(IntPtr Hwnd, string Title, string ProcessName, string? Aumid, bool Visible, bool Cloaked);
 
+    // Returns all matching HWNDs from the first pass that found anything.
+    // Order is Z-order top-to-bottom, so callers can use index 0 as a
+    // "most recently active" fallback when smarter disambiguation has no
+    // signal.
+    public static IReadOnlyList<Resolution> ResolveAll(string aumid)
+    {
+        if (string.IsNullOrEmpty(aumid)) return Array.Empty<Resolution>();
+
+        var candidates = EnumerateTopLevelWindows();
+        var ownPid = (uint)Environment.ProcessId;
+
+        var pass1 = new List<Resolution>();
+        foreach (var hwnd in candidates)
+        {
+            if (!TryGetWindowPid(hwnd, out var pid) || pid == ownPid) continue;
+            var windowAumid = TryGetWindowAumid(hwnd);
+            if (string.IsNullOrEmpty(windowAumid)) continue;
+            if (string.Equals(windowAumid, aumid, StringComparison.OrdinalIgnoreCase))
+            {
+                pass1.Add(new Resolution(hwnd, "aumid", GetWindowTitle(hwnd), TryGetProcessName(pid)));
+            }
+        }
+        if (pass1.Count > 0) return pass1;
+
+        var tokens = aumid
+            .Split(new[] { '.', '!', '_', '-' }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(t => t.Length >= 3)
+            .ToArray();
+        var pass2 = new List<Resolution>();
+        foreach (var hwnd in candidates)
+        {
+            if (!TryGetWindowPid(hwnd, out var pid) || pid == ownPid) continue;
+            var procName = TryGetProcessName(pid);
+            if (string.IsNullOrEmpty(procName)) continue;
+            foreach (var token in tokens)
+            {
+                if (string.Equals(token, procName, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(StripExe(token), procName, StringComparison.OrdinalIgnoreCase))
+                {
+                    pass2.Add(new Resolution(hwnd, "procname", GetWindowTitle(hwnd), procName));
+                    break;
+                }
+            }
+        }
+        return pass2;
+    }
+
     public static IReadOnlyList<Candidate> Diagnose()
     {
         var list = new List<Candidate>();
@@ -32,49 +79,8 @@ internal static class WindowResolver
 
     public static Resolution? Resolve(string aumid)
     {
-        if (string.IsNullOrEmpty(aumid)) return null;
-
-        // EnumWindows yields top-to-bottom Z-order, so first match wins as
-        // "most recently active" — the v1 tiebreak for multi-window apps
-        // like Chrome where the toast can't tell us which window/profile.
-        var candidates = EnumerateTopLevelWindows();
-        var ownPid = (uint)Environment.ProcessId;
-
-        // Pass 1: explicit AUMID match via SHGetPropertyStoreForWindow.
-        foreach (var hwnd in candidates)
-        {
-            if (!TryGetWindowPid(hwnd, out var pid) || pid == ownPid) continue;
-            var windowAumid = TryGetWindowAumid(hwnd);
-            if (string.IsNullOrEmpty(windowAumid)) continue;
-            if (string.Equals(windowAumid, aumid, StringComparison.OrdinalIgnoreCase))
-            {
-                return new Resolution(hwnd, "aumid", GetWindowTitle(hwnd), TryGetProcessName(pid));
-            }
-        }
-
-        // Pass 2: process-name match against AUMID tokens. Many classic
-        // apps have AUMIDs like "Microsoft.Office.OUTLOOK.EXE.15" or
-        // "com.squirrel.slack.slack" where one token is the exe basename.
-        var tokens = aumid
-            .Split(new[] { '.', '!', '_', '-' }, StringSplitOptions.RemoveEmptyEntries)
-            .Where(t => t.Length >= 3)
-            .ToArray();
-        foreach (var hwnd in candidates)
-        {
-            if (!TryGetWindowPid(hwnd, out var pid) || pid == ownPid) continue;
-            var procName = TryGetProcessName(pid);
-            if (string.IsNullOrEmpty(procName)) continue;
-            foreach (var token in tokens)
-            {
-                if (string.Equals(token, procName, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(StripExe(token), procName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return new Resolution(hwnd, "procname", GetWindowTitle(hwnd), procName);
-                }
-            }
-        }
-
-        return null;
+        var all = ResolveAll(aumid);
+        return all.Count == 0 ? null : all[0];
     }
 
     private static string StripExe(string token)

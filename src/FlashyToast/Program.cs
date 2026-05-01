@@ -12,6 +12,13 @@ internal static class Program
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
 
     private static readonly Flasher _flasher = new();
+    private static readonly TitleChangeMonitor _titles = new();
+
+    // How recent a title change must be (relative to toast observation) for
+    // us to trust it as the originating window. Toast polling adds up to
+    // PollInterval of latency on top of the actual title-flip-to-toast gap,
+    // so this needs to comfortably exceed PollInterval.
+    private static readonly TimeSpan TitleChangeWindow = TimeSpan.FromSeconds(5);
 
     private const string MutexName = @"Local\flashy-toast-singleton";
 
@@ -102,8 +109,16 @@ internal static class Program
             cts.Cancel();
         };
 
+        _titles.Start();
         Log($"polling Action Center every {PollInterval.TotalSeconds:0.#}s. Ctrl+C to exit.");
-        await PollLoop(listener, seen, cts.Token);
+        try
+        {
+            await PollLoop(listener, seen, cts.Token);
+        }
+        finally
+        {
+            _titles.Stop();
+        }
         return 0;
     }
 
@@ -150,19 +165,50 @@ internal static class Program
             return;
         }
 
-        var resolved = WindowResolver.Resolve(aumid);
-        if (resolved is null)
+        var matches = WindowResolver.ResolveAll(aumid);
+        if (matches.Count == 0)
         {
             Log($"toast id={n.Id} aumid={aumid} pfn={pfn} display={Quote(displayName)} text=[{text}] → unresolved");
             DumpCandidates();
             return;
         }
 
+        var (winner, pickReason) = PickWinner(matches);
         var debounceKey = aumid;
-        var result = _flasher.TryFlash(resolved.Hwnd, debounceKey);
+        var result = _flasher.TryFlash(winner.Hwnd, debounceKey);
         Log($"toast id={n.Id} aumid={aumid} display={Quote(displayName)} → " +
-            $"hwnd=0x{resolved.Hwnd.ToInt64():X} stage={resolved.Stage} " +
-            $"proc={resolved.ProcessName} title={Quote(resolved.WindowTitle)} flash={result}");
+            $"hwnd=0x{winner.Hwnd.ToInt64():X} stage={winner.Stage} pick={pickReason} " +
+            $"proc={winner.ProcessName} title={Quote(winner.WindowTitle)} flash={result} " +
+            $"matches={matches.Count}");
+    }
+
+    private static (WindowResolver.Resolution Winner, string Reason) PickWinner(IReadOnlyList<WindowResolver.Resolution> matches)
+    {
+        if (matches.Count == 1) return (matches[0], "only-match");
+
+        // Among multi-window candidates (Chrome being the canonical case),
+        // the originating tab/window typically just changed its title in
+        // response to the underlying notification. Pick the most-recent
+        // change within TitleChangeWindow.
+        var cutoff = DateTime.UtcNow - TitleChangeWindow;
+        WindowResolver.Resolution? best = null;
+        DateTime bestTime = DateTime.MinValue;
+        foreach (var m in matches)
+        {
+            var t = _titles.LastChange(m.Hwnd);
+            if (t is null || t.Value < cutoff) continue;
+            if (t.Value > bestTime)
+            {
+                bestTime = t.Value;
+                best = m;
+            }
+        }
+        if (best is not null)
+        {
+            var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
+            return (best, $"title-change({ageMs}ms)");
+        }
+        return (matches[0], "z-order");
     }
 
     private static void DumpCandidates()
