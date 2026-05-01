@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Text;
 using Windows.UI.Notifications;
 using Windows.UI.Notifications.Management;
@@ -7,49 +6,25 @@ namespace FlashyToast;
 
 internal static class Program
 {
-    // NotificationChanged event subscription requires packaged identity / a
-    // registered background task; for an unpackaged Win32 console exe it
-    // throws 0x80070490 ELEMENT_NOT_FOUND. Poll GetNotificationsAsync instead.
-    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
-
     private static readonly Flasher _flasher = new();
     private static readonly TitleChangeMonitor _titles = new();
     private static StreamWriter? _logFile;
 
     // How recent a title change must be (relative to toast observation) for
-    // us to trust it as the originating window. Toast polling adds up to
-    // PollInterval of latency on top of the actual title-flip-to-toast gap,
-    // so this needs to comfortably exceed PollInterval.
+    // us to trust it as the originating window. Event delivery is sub-second
+    // so a small window is fine, but tab-switch + toast-fire ordering can
+    // span a couple seconds on slow systems — keep some slack.
     private static readonly TimeSpan TitleChangeWindow = TimeSpan.FromSeconds(5);
 
     private const string MutexName = @"Local\flashy-toast-singleton";
 
+    // NotificationChanged events fire on threadpool threads; serialize
+    // access to _flasher's debounce dict and _seen.
+    private static readonly object _handleLock = new();
+    private static readonly HashSet<uint> _seen = new();
+
     private static async Task<int> Main(string[] args)
     {
-        // We're a WinExe (no console allocated). For interactive --install /
-        // --uninstall invocations from a terminal, attach to the parent's
-        // console so Installer's writes show up where the user ran us from.
-        bool isInstallerCommand = args.Length == 1 &&
-            (args[0].Equals("--install", StringComparison.OrdinalIgnoreCase) ||
-             args[0].Equals("--uninstall", StringComparison.OrdinalIgnoreCase));
-        if (isInstallerCommand)
-        {
-            AttachConsole(ATTACH_PARENT_PROCESS);
-            // Setting OutputEncoding throws IOException("handle is invalid")
-            // when no console is attached, which is the normal-run case for
-            // a WinExe. Only safe to set when we just attached one.
-            try { Console.OutputEncoding = Encoding.UTF8; } catch { }
-        }
-
-        if (args.Length == 1 && args[0].Equals("--install", StringComparison.OrdinalIgnoreCase))
-        {
-            return Installer.Install();
-        }
-        if (args.Length == 1 && args[0].Equals("--uninstall", StringComparison.OrdinalIgnoreCase))
-        {
-            return Installer.Uninstall();
-        }
-
         OpenLogFile();
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
             Log($"unhandled exception: {e.ExceptionObject}");
@@ -104,13 +79,12 @@ internal static class Program
             return 1;
         }
 
-        var seen = new HashSet<uint>();
         try
         {
             var initial = await listener.GetNotificationsAsync(NotificationKinds.Toast);
-            foreach (var n in initial)
+            lock (_handleLock)
             {
-                seen.Add(n.Id);
+                foreach (var n in initial) _seen.Add(n.Id);
             }
             Log($"existing toasts at startup: {initial.Count} (suppressed)");
         }
@@ -120,19 +94,23 @@ internal static class Program
             return 3;
         }
 
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            e.Cancel = true;
-            Log("Ctrl+C received; shutting down.");
-            cts.Cancel();
-        };
-
-        _titles.Start();
-        Log($"polling Action Center every {PollInterval.TotalSeconds:0.#}s. Ctrl+C to exit.");
         try
         {
-            await PollLoop(listener, seen, cts.Token);
+            listener.NotificationChanged += OnNotificationChanged;
+            Log("subscribed to NotificationChanged.");
+        }
+        catch (Exception ex)
+        {
+            Log($"NotificationChanged subscription threw: {ex.GetType().Name}: {ex.Message} (HRESULT 0x{ex.HResult:X8})");
+            return 5;
+        }
+
+        _titles.Start();
+        try
+        {
+            // Run until process kill / logoff. We're a packaged background
+            // app under windows.startupTask; lifetime is OS-managed.
+            await Task.Delay(Timeout.Infinite);
         }
         finally
         {
@@ -141,32 +119,23 @@ internal static class Program
         return 0;
     }
 
-    private static async Task PollLoop(UserNotificationListener listener, HashSet<uint> seen, CancellationToken ct)
+    private static void OnNotificationChanged(UserNotificationListener sender, UserNotificationChangedEventArgs args)
     {
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                var current = await listener.GetNotificationsAsync(NotificationKinds.Toast);
-                var currentIds = new HashSet<uint>();
-                foreach (var n in current)
-                {
-                    currentIds.Add(n.Id);
-                    if (!seen.Contains(n.Id))
-                    {
-                        Handle(n);
-                    }
-                }
-                seen.Clear();
-                foreach (var id in currentIds) seen.Add(id);
-            }
-            catch (Exception ex)
-            {
-                Log($"poll error: {ex.GetType().Name}: {ex.Message}");
-            }
+        if (args.ChangeKind != UserNotificationChangedKind.Added) return;
 
-            try { await Task.Delay(PollInterval, ct); }
-            catch (TaskCanceledException) { break; }
+        UserNotification? n = null;
+        try { n = sender.GetNotification(args.UserNotificationId); }
+        catch (Exception ex)
+        {
+            Log($"GetNotification({args.UserNotificationId}) threw: {ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+        if (n is null) return;
+
+        lock (_handleLock)
+        {
+            if (!_seen.Add(n.Id)) return;
+            Handle(n);
         }
     }
 
@@ -305,8 +274,7 @@ internal static class Program
         catch
         {
             // Logging is best-effort; if we can't open the log file we still
-            // run, just silently. Console.WriteLine below is also a no-op
-            // when no console is attached (the WinExe normal-run case).
+            // run, just silently.
         }
     }
 
@@ -314,12 +282,5 @@ internal static class Program
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
         try { _logFile?.WriteLine(line); } catch { }
-        Console.WriteLine(line);
     }
-
-    private const int ATTACH_PARENT_PROCESS = -1;
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool AttachConsole(int dwProcessId);
 }

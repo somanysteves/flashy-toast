@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity
+    Name="FlashyToast"
+    Publisher="CN=flashy-toast"
+    Version="0.3.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>flashy-toast</DisplayName>
+    <PublisherDisplayName>flashy-toast</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26200.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="FlashyToast" Executable="flashy-toast.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="flashy-toast"
+        Description="Flashes the source app's taskbar entry on every Action Center toast."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default" />
+
+      <Extensions>
+        <!-- Enabled="true" works for packaged desktop apps (no consent dialog).
+             User must launch the app once after install to actually arm
+             auto-start; Windows enforces this regardless of Enabled. -->
+        <uap5:Extension Category="windows.startupTask"
+                        Executable="flashy-toast.exe"
+                        EntryPoint="Windows.FullTrustApplication">
+          <uap5:StartupTask TaskId="FlashyToastStartup"
+                            Enabled="true"
+                            DisplayName="flashy-toast" />
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="userNotificationListener" />
+  </Capabilities>
+</Package>

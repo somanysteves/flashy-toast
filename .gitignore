@@ -7,3 +7,6 @@ obj/
 *.swp
 publish/
 out/
+dist/
+.claude/
+*.pfx

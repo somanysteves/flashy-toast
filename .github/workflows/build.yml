@@ -18,10 +18,12 @@ jobs:
 
       - id: build
         shell: pwsh
-        run: ./build.ps1
+        # CI builds are unsigned — no code-signing cert is available on the
+        # PR runner. The release workflow signs.
+        run: ./build.ps1 -Sign:$false
 
       - uses: actions/upload-artifact@v4
         with:
-          name: flashy-toast
-          path: ${{ steps.build.outputs.exe }}
+          name: flashy-toast-msix-unsigned
+          path: ${{ steps.build.outputs.msix }}
           if-no-files-found: error

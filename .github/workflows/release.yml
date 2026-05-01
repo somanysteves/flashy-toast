@@ -1,8 +1,14 @@
 name: release
 
+# Manual dispatch only — never auto-publish on tag push. The repo owner
+# decides when (and whether) to cut a release.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (w.x.y.z)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -17,12 +23,35 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      - name: Decode signing cert
+        if: ${{ env.SIGNING_PFX_BASE64 != '' }}
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.SIGNING_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.SIGNING_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
+          [IO.File]::WriteAllBytes("signing.pfx", $bytes)
+          $secure = ConvertTo-SecureString -String $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath signing.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure | Out-Null
+
       - id: build
         shell: pwsh
-        run: ./build.ps1
+        # If SIGNING_PFX_BASE64 is configured, build.ps1 will pick up the cert
+        # from CurrentUser\My matching CertSubject. Otherwise it'll generate
+        # an ephemeral self-signed cert (bad for distribution — release notes
+        # should make this clear).
+        run: ./build.ps1 -Version "${{ github.event.inputs.version }}"
 
-      - name: Create release
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
-        run: gh release create $env:GITHUB_REF_NAME "${{ steps.build.outputs.exe }}" --title $env:GITHUB_REF_NAME --generate-notes
+        run: |
+          $tag = "v${{ github.event.inputs.version }}"
+          gh release create $tag `
+            "${{ steps.build.outputs.msix }}" `
+            "${{ steps.build.outputs.cer }}" `
+            --title $tag `
+            --draft `
+            --generate-notes

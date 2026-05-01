@@ -14,18 +14,28 @@ invisible to bug.n.
 
 ## Install
 
-PowerShell, run as your normal user (no admin):
+flashy-toast ships as a self-signed `.msix` package. Two-step install:
+
+**1. Trust the signing cert (admin PowerShell, once per machine):**
 
 ```powershell
-$d = "$env:LOCALAPPDATA\flashy-toast"; ni $d -ItemType Directory -Force | Out-Null; iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.exe -OutFile "$d\flashy-toast.exe"; & "$d\flashy-toast.exe" --install; Start-Process "$d\flashy-toast.exe"
+iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.cer -OutFile flashy-toast.cer
+Import-Certificate -FilePath flashy-toast.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
 ```
 
-That downloads the exe to `%LOCALAPPDATA%\flashy-toast\`, drops a shortcut in
-your Startup folder so it auto-runs at login, and starts it now.
+**2. Install the package (normal-user PowerShell):**
+
+```powershell
+iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.msix -OutFile flashy-toast.msix
+Add-AppxPackage flashy-toast.msix
+```
+
+**3. Launch flashy-toast once from the Start menu** (search "flashy-toast"). Windows
+requires this one-time manual launch before auto-start kicks in. After that the
+app starts on every login automatically — no shortcut, no console, no UI.
 
 First run pops a Windows Settings prompt asking to allow notification access —
-grant it. After that flashy-toast runs silently in the background; nothing
-is shown on screen.
+grant it.
 
 ## Logs
 
@@ -44,9 +54,14 @@ Get-Content -Wait "$env:LOCALAPPDATA\flashy-toast\flashy-toast.log"
 ## Uninstall
 
 ```powershell
-& "$env:LOCALAPPDATA\flashy-toast\flashy-toast.exe" --uninstall
-Get-Process flashy-toast -ErrorAction SilentlyContinue | Stop-Process
-Remove-Item "$env:LOCALAPPDATA\flashy-toast" -Recurse -Force
+Get-AppxPackage -Name FlashyToast | Remove-AppxPackage
+Remove-Item "$env:LOCALAPPDATA\flashy-toast" -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+To also drop the trusted cert (admin):
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=flashy-toast' | Remove-Item
 ```
 
 ## Build from source
@@ -64,5 +79,6 @@ CI runs the same script (`.github/workflows/build.yml`, `.github/workflows/relea
 ## How it works
 
 See [PLAN.md](PLAN.md) for the design and the gotchas worth knowing about
-(why we poll instead of subscribing to `NotificationChanged`, why we don't
-filter on `IsWindowVisible`, how Chrome multi-window disambiguation works).
+(why we don't filter on `IsWindowVisible`, how Chrome multi-window
+disambiguation works, why packaged identity is required for
+`NotificationChanged`).

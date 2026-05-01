@@ -38,20 +38,19 @@ C# console exe (no UI, optional tray icon later) that:
 4. Stays alive for the user session; launched at login via Startup-folder
    shortcut or Task Scheduler logon trigger (decide during dev).
 
-### NotificationChanged vs polling
+### NotificationChanged: packaged identity required
 
 Subscribing to `UserNotificationListener.NotificationChanged` from an
-unpackaged Win32 console exe throws `COMException 0x80070490`
-(`ELEMENT_NOT_FOUND`) at `add_NotificationChanged` time. The event delivery
-path requires a registered background task / packaged identity that
-unpackaged exes don't have. `RequestAccessAsync` and `GetNotificationsAsync`
-both work fine without packaging — only the event subscription is gated.
+unpackaged Win32 exe throws `COMException 0x80070490` (`ELEMENT_NOT_FOUND`)
+at `add_NotificationChanged` time. The event delivery path requires
+package identity. `RequestAccessAsync` and `GetNotificationsAsync` both
+work fine without packaging — only the event subscription is gated.
 
-Confirmed empirically on 2026-04-30 against Windows 11 26200. Polling at
-2s lines up with PLAN's per-app debounce window, so latency is acceptable.
-Polling will miss any toast that appears AND disappears entirely between
-ticks; that's acceptable (if the user already cleared it, no need to
-flash retroactively). Revisit if we ever package as MSIX.
+Confirmed empirically on 2026-04-30 (failure on unpackaged exe) and
+2026-05-01 (subscription succeeds inside an installed `.msix`). On the
+packaged side we use the foreground in-process event handler — no
+background-task registration required for an always-running session
+daemon.
 
 `FlashWindowEx` fires `HSHELL_FLASH`, which is exactly what bug.n already
 catches in `Manager_onShellMessage` and routes to `Manager_markUrgent`. No
@@ -167,14 +166,21 @@ flashy-toast/
    2s debounce; skips foreground windows and own PID. Verified end-to-end:
    Chrome toast on a different bug.n workspace produces `flash=Flashed` and
    bug.n's shell-hook handler marks the correct workspace urgent.
-4. ⏳ **Auto-start.** Single-instance mutex (`Local\flashy-toast-singleton`)
-   verified blocking second launch with exit 4. `--install` / `--uninstall`
-   flags create/remove a shortcut in `shell:startup` pointing to the current
-   exe via `WScript.Shell`. Not yet run on this machine. Recommended flow:
-   `dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true`,
-   move the exe to a stable path (e.g. `%LOCALAPPDATA%\flashy-toast\`),
-   run `flashy-toast.exe --install` once.
-5. **Polish (later).** Tray icon, pause toggle, log file, signed build.
+4. ✅ **Auto-start.** Replaced the Startup-folder shortcut approach with a
+   packaged-desktop `windows.startupTask` extension (`Enabled="true"`, no
+   consent dialog per MSIX docs). Single-instance mutex
+   (`Local\flashy-toast-singleton`) preserved for safety. User must launch
+   the packaged app once from the Start menu before Windows arms auto-start
+   (OS-level requirement, not a code thing).
+5. ✅ **MSIX + events.** Self-signed MSIX package gives the exe packaged
+   identity, which unlocks the foreground `NotificationChanged` event
+   (verified empirically — subscription succeeds with no `0x80070490`).
+   Polling loop deleted; latency drops from ≤ 2 s to sub-second. Build
+   pipeline (`build.ps1`) generates a self-signed cert if needed, publishes
+   the exe, packs via `MakeAppx`, and signs with `signtool`.
+6. **Polish (later).** Tray icon, pause toggle, log rotation, real
+   code-signing cert (replace self-signed → CA-signed without manifest
+   changes), Microsoft Store submission for free auto-update.
 
 ### Milestone 2/3 gotcha: do NOT filter on `IsWindowVisible`
 
@@ -195,8 +201,10 @@ the urgency signal regardless.
 
 - ~~Does `UserNotificationListener.NotificationChanged` deliver to an
   unpackaged Win32 console exe?~~ **No** — `add_NotificationChanged` throws
-  `0x80070490`. Switched to 2s polling of `GetNotificationsAsync`. (Resolved
-  in milestone 1, 2026-04-30.)
+  `0x80070490`. Initial workaround: 2s polling of `GetNotificationsAsync`.
+  Replaced in milestone 5 by packaging the exe as a self-signed MSIX, which
+  gives it the package identity that unlocks the event subscription.
+  (Resolved 2026-05-01.)
 - Does `UserNotificationListener` deliver toasts from background services
   (e.g. Slack while minimized to tray)? Expected yes, verify in milestone 1
   by leaving the listener running and triggering toasts from each target
