@@ -4,20 +4,33 @@ namespace FlashyToast;
 
 internal sealed class Flasher
 {
-    private readonly Dictionary<string, DateTime> _lastFlashByKey = new(StringComparer.OrdinalIgnoreCase);
+    // HWND-keyed debounce: the same window can receive both a toast-listener
+    // signal and an audio-session signal for one underlying notification, and
+    // we don't want to flash twice. Keying on HWND naturally dedupes regardless
+    // of which trigger fires first.
+    private readonly Dictionary<IntPtr, DateTime> _lastFlashByHwnd = new();
     private readonly TimeSpan _debounce = TimeSpan.FromSeconds(2);
+    private readonly object _lock = new();
 
-    public Flash TryFlash(IntPtr hwnd, string debounceKey)
+    public Flash TryFlash(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return Flash.NoTarget;
-        if (GetForegroundWindow() == hwnd) return Flash.SkippedForeground;
+
+        // Only flash hidden windows. Visible windows (including the foreground)
+        // are already in front of the user — flashing them adds nothing and
+        // is occasionally jarring. The use case is windows that bug.n / virtual
+        // desktops have hidden via SW_HIDE; those return false here.
+        if (IsWindowVisible(hwnd)) return Flash.SkippedVisible;
 
         var now = DateTime.UtcNow;
-        if (_lastFlashByKey.TryGetValue(debounceKey, out var last) && now - last < _debounce)
+        lock (_lock)
         {
-            return Flash.SkippedDebounce;
+            if (_lastFlashByHwnd.TryGetValue(hwnd, out var last) && now - last < _debounce)
+            {
+                return Flash.SkippedDebounce;
+            }
+            _lastFlashByHwnd[hwnd] = now;
         }
-        _lastFlashByKey[debounceKey] = now;
 
         var info = new FLASHWINFO
         {
@@ -30,7 +43,7 @@ internal sealed class Flasher
         return FlashWindowEx(ref info) ? Flash.Flashed : Flash.PInvokeFailed;
     }
 
-    public enum Flash { Flashed, SkippedForeground, SkippedDebounce, NoTarget, PInvokeFailed }
+    public enum Flash { Flashed, SkippedVisible, SkippedDebounce, NoTarget, PInvokeFailed }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FLASHWINFO
@@ -49,5 +62,6 @@ internal sealed class Flasher
     private static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
 
     [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
 }

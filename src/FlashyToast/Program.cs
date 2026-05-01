@@ -8,13 +8,19 @@ internal static class Program
 {
     private static readonly Flasher _flasher = new();
     private static readonly TitleChangeMonitor _titles = new();
+    private static readonly AudioSessionMonitor _audio = new();
     private static StreamWriter? _logFile;
 
-    // How recent a title change must be (relative to toast observation) for
-    // us to trust it as the originating window. Event delivery is sub-second
-    // so a small window is fine, but tab-switch + toast-fire ordering can
-    // span a couple seconds on slow systems — keep some slack.
+    // How recent a title change must be (relative to toast/audio observation)
+    // for us to trust it as the originating window. Event delivery is
+    // sub-second so a small window is fine, but tab-switch + toast-fire
+    // ordering can span a couple seconds on slow systems — keep some slack.
     private static readonly TimeSpan TitleChangeWindow = TimeSpan.FromSeconds(5);
+
+    // Audio sessions shorter than this are treated as notification dings (used
+    // as fallback when the originating app is not a known title-changer).
+    // Calls/music/video stay Active far longer than this.
+    private static readonly TimeSpan ShortSoundMax = TimeSpan.FromMilliseconds(1500);
 
     private const string MutexName = @"Local\flashy-toast-singleton";
 
@@ -106,6 +112,23 @@ internal static class Program
         }
 
         _titles.Start();
+
+        // Audio path: subscribe alongside the toast listener. On machines
+        // where notification access is denied, we'd have already returned
+        // above; on machines where it's allowed, both signals fire and the
+        // Flasher's HWND-based debounce dedupes.
+        _audio.OnActivated += a => SafeRun(() => HandleAudioActive(a.Pid));
+        _audio.OnDeactivated += d => SafeRun(() => HandleAudioInactive(d.Pid, d.Duration));
+        try
+        {
+            _audio.Start();
+            Log("AudioSessionMonitor started.");
+        }
+        catch (Exception ex)
+        {
+            Log($"AudioSessionMonitor start failed: {ex.GetType().Name}: {ex.Message} — audio trigger disabled, toast path still active.");
+        }
+
         try
         {
             // Run until process kill / logoff. We're a packaged background
@@ -115,8 +138,15 @@ internal static class Program
         finally
         {
             _titles.Stop();
+            _audio.Dispose();
         }
         return 0;
+    }
+
+    private static void SafeRun(Action a)
+    {
+        try { a(); }
+        catch (Exception ex) { Log($"audio handler threw: {ex.GetType().Name}: {ex.Message}"); }
     }
 
     private static void OnNotificationChanged(UserNotificationListener sender, UserNotificationChangedEventArgs args)
@@ -161,9 +191,13 @@ internal static class Program
             return;
         }
 
+        // Pick among ALL matches, not just hidden ones. If the winner turns
+        // out to be visible (the originating window is on the user's current
+        // workspace), Flasher's IsWindowVisible check skips the flash. We
+        // must NOT filter to hidden first — that would let a runner-up hidden
+        // window get flashed when the real originating window is visible.
         var (winner, pickReason) = PickWinner(matches);
-        var debounceKey = aumid;
-        var result = _flasher.TryFlash(winner.Hwnd, debounceKey);
+        var result = _flasher.TryFlash(winner.Hwnd);
         Log($"toast id={n.Id} aumid={aumid} display={Quote(displayName)} → " +
             $"hwnd=0x{winner.Hwnd.ToInt64():X} stage={winner.Stage} pick={pickReason} " +
             $"proc={winner.ProcessName} title={Quote(winner.WindowTitle)} flash={result} " +
@@ -174,6 +208,13 @@ internal static class Program
     {
         if (matches.Count == 1) return (matches[0], "only-match");
 
+        var picked = PickByTitleChange(matches);
+        if (picked is { } p) return p;
+        return (matches[0], "z-order");
+    }
+
+    private static (WindowResolver.Resolution Winner, string Reason)? PickByTitleChange(IReadOnlyList<WindowResolver.Resolution> candidates)
+    {
         // Among multi-window candidates (Chrome being the canonical case),
         // the originating tab/window typically just changed its title in
         // response to the underlying notification. Pick the most-recent
@@ -181,7 +222,7 @@ internal static class Program
         var cutoff = DateTime.UtcNow - TitleChangeWindow;
         WindowResolver.Resolution? best = null;
         DateTime bestTime = DateTime.MinValue;
-        foreach (var m in matches)
+        foreach (var m in candidates)
         {
             var t = _titles.LastChange(m.Hwnd);
             if (t is null || t.Value < cutoff) continue;
@@ -191,12 +232,85 @@ internal static class Program
                 best = m;
             }
         }
-        if (best is not null)
+        if (best is null) return null;
+        var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
+        return (best, $"title-change({ageMs}ms)");
+    }
+
+    private static void HandleAudioActive(uint pid)
+    {
+        // Title-changer apps fire fast: try to pick a winner based on a recent
+        // title change right now (audio came up, title likely just flipped).
+        // Non-title-changers wait for HandleAudioInactive — we need duration
+        // to discriminate notification dings from music/calls.
+        var procName = WindowResolver.ProcessNameForPid(pid);
+        if (string.IsNullOrEmpty(procName)) return;
+        if (!_titles.HasEverChangedTitle(procName)) return;
+
+        var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) return;
+
+        // Pick among all windows; Flasher will skip if winner is visible.
+        var pick = PickByTitleChange(hwnds);
+        if (pick is null)
         {
-            var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
-            return (best, $"title-change({ageMs}ms)");
+            Log($"audio-active pid={pid} proc={procName} matches={hwnds.Count} → no recent title change, wait for inactive");
+            return;
         }
-        return (matches[0], "z-order");
+
+        var result = _flasher.TryFlash(pick.Value.Winner.Hwnd);
+        Log($"audio-active pid={pid} proc={procName} → " +
+            $"hwnd=0x{pick.Value.Winner.Hwnd.ToInt64():X} pick={pick.Value.Reason} " +
+            $"title={Quote(pick.Value.Winner.WindowTitle)} flash={result}");
+    }
+
+    private static void HandleAudioInactive(uint pid, TimeSpan duration)
+    {
+        var procName = WindowResolver.ProcessNameForPid(pid);
+        if (string.IsNullOrEmpty(procName)) return;
+
+        var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) return;
+
+        if (_titles.HasEverChangedTitle(procName))
+        {
+            // Title changed AFTER Activated? Re-check now. HWND-debounce in
+            // Flasher prevents double-flash if Activated already fired.
+            var pick = PickByTitleChange(hwnds);
+            if (pick is null)
+            {
+                Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → titlechanger, no recent title change, skip");
+                return;
+            }
+            var result = _flasher.TryFlash(pick.Value.Winner.Hwnd);
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
+                $"hwnd=0x{pick.Value.Winner.Hwnd.ToInt64():X} pick={pick.Value.Reason} " +
+                $"title={Quote(pick.Value.Winner.WindowTitle)} flash={result}");
+            return;
+        }
+
+        // Non-titlechanger: short-sound heuristic. Anything longer than
+        // ShortSoundMax is assumed to be media/call audio, not a notification.
+        if (duration > ShortSoundMax)
+        {
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → too long for short-sound, skip");
+            return;
+        }
+
+        // No title-change signal — we don't know which window is originating.
+        // Filter to hidden so we don't false-flash a window the user can see;
+        // pick z-order top among hidden.
+        var hidden = hwnds.Where(r => !WindowResolver.IsHwndVisible(r.Hwnd)).ToList();
+        if (hidden.Count == 0)
+        {
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → short-sound but all windows visible, skip");
+            return;
+        }
+
+        var winner = hidden[0];
+        var flash = _flasher.TryFlash(winner.Hwnd);
+        Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
+            $"short-sound hwnd=0x{winner.Hwnd.ToInt64():X} hidden={hidden.Count}/{hwnds.Count} title={Quote(winner.WindowTitle)} flash={flash}");
     }
 
     private static void DumpCandidates()

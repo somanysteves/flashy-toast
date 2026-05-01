@@ -57,6 +57,32 @@ internal static class WindowResolver
         return pass2;
     }
 
+    // Returns all top-level windows owned by `pid`, in Z-order. Used by the
+    // audio-trigger path: we get a PID from IAudioSessionControl2::GetProcessId
+    // and need to find candidate windows to flash without an AUMID join.
+    public static IReadOnlyList<Resolution> ResolveByPid(uint pid)
+    {
+        if (pid == 0) return Array.Empty<Resolution>();
+        var ownPid = (uint)Environment.ProcessId;
+        if (pid == ownPid) return Array.Empty<Resolution>();
+
+        var procName = TryGetProcessName(pid);
+        var list = new List<Resolution>();
+        foreach (var hwnd in EnumerateTopLevelWindows())
+        {
+            if (!TryGetWindowPid(hwnd, out var p) || p != pid) continue;
+            list.Add(new Resolution(hwnd, "pid", GetWindowTitle(hwnd), procName));
+        }
+        return list;
+    }
+
+    public static string ProcessNameForPid(uint pid) => TryGetProcessName(pid);
+
+    // Public visibility check used by Flasher and decision paths. bug.n hides
+    // windows via SW_HIDE which clears WS_VISIBLE; IsWindowVisible returns
+    // false for those, true for windows the user can currently see.
+    public static bool IsHwndVisible(IntPtr hwnd) => IsWindowVisible(hwnd);
+
     public static IReadOnlyList<Candidate> Diagnose()
     {
         var list = new List<Candidate>();
