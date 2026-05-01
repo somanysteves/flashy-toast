@@ -167,7 +167,13 @@ flashy-toast/
    2s debounce; skips foreground windows and own PID. Verified end-to-end:
    Chrome toast on a different bug.n workspace produces `flash=Flashed` and
    bug.n's shell-hook handler marks the correct workspace urgent.
-4. **Auto-start.** Startup folder shortcut + single-instance mutex.
+4. ⏳ **Auto-start.** Single-instance mutex (`Local\flashy-toast-singleton`)
+   verified blocking second launch with exit 4. `--install` / `--uninstall`
+   flags create/remove a shortcut in `shell:startup` pointing to the current
+   exe via `WScript.Shell`. Not yet run on this machine. Recommended flow:
+   `dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true`,
+   move the exe to a stable path (e.g. `%LOCALAPPDATA%\flashy-toast\`),
+   run `flashy-toast.exe --install` once.
 5. **Polish (later).** Tray icon, pause toggle, log file, signed build.
 
 ### Milestone 2/3 gotcha: do NOT filter on `IsWindowVisible`

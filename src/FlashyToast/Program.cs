@@ -13,10 +13,50 @@ internal static class Program
 
     private static readonly Flasher _flasher = new();
 
+    private const string MutexName = @"Local\flashy-toast-singleton";
+
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
 
+        if (args.Length == 1 && args[0].Equals("--install", StringComparison.OrdinalIgnoreCase))
+        {
+            return Installer.Install();
+        }
+        if (args.Length == 1 && args[0].Equals("--uninstall", StringComparison.OrdinalIgnoreCase))
+        {
+            return Installer.Uninstall();
+        }
+
+        using var mutex = new Mutex(initiallyOwned: false, MutexName, out _);
+        bool acquired;
+        try
+        {
+            acquired = mutex.WaitOne(TimeSpan.Zero, exitContext: false);
+        }
+        catch (AbandonedMutexException)
+        {
+            // Previous owner crashed without releasing; we still own it now.
+            acquired = true;
+        }
+        if (!acquired)
+        {
+            Log("another flashy-toast is already running; exiting.");
+            return 4;
+        }
+
+        try
+        {
+            return await Run();
+        }
+        finally
+        {
+            try { mutex.ReleaseMutex(); } catch (ApplicationException) { }
+        }
+    }
+
+    private static async Task<int> Run()
+    {
         var listener = UserNotificationListener.Current;
 
         Log("requesting UserNotificationListener access...");
