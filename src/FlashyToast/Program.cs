@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text;
 using Windows.UI.Notifications;
 using Windows.UI.Notifications.Management;
@@ -13,6 +14,7 @@ internal static class Program
 
     private static readonly Flasher _flasher = new();
     private static readonly TitleChangeMonitor _titles = new();
+    private static StreamWriter? _logFile;
 
     // How recent a title change must be (relative to toast observation) for
     // us to trust it as the originating window. Toast polling adds up to
@@ -24,7 +26,20 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
+        // We're a WinExe (no console allocated). For interactive --install /
+        // --uninstall invocations from a terminal, attach to the parent's
+        // console so Installer's writes show up where the user ran us from.
+        bool isInstallerCommand = args.Length == 1 &&
+            (args[0].Equals("--install", StringComparison.OrdinalIgnoreCase) ||
+             args[0].Equals("--uninstall", StringComparison.OrdinalIgnoreCase));
+        if (isInstallerCommand)
+        {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            // Setting OutputEncoding throws IOException("handle is invalid")
+            // when no console is attached, which is the normal-run case for
+            // a WinExe. Only safe to set when we just attached one.
+            try { Console.OutputEncoding = Encoding.UTF8; } catch { }
+        }
 
         if (args.Length == 1 && args[0].Equals("--install", StringComparison.OrdinalIgnoreCase))
         {
@@ -34,6 +49,10 @@ internal static class Program
         {
             return Installer.Uninstall();
         }
+
+        OpenLogFile();
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            Log($"unhandled exception: {e.ExceptionObject}");
 
         using var mutex = new Mutex(initiallyOwned: false, MutexName, out _);
         bool acquired;
@@ -265,8 +284,42 @@ internal static class Program
 
     private static string Quote(string s) => "\"" + s.Replace("\"", "\\\"") + "\"";
 
+    public static string LogFilePath()
+        => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "flashy-toast", "flashy-toast.log");
+
+    private static void OpenLogFile()
+    {
+        try
+        {
+            var path = LogFilePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+            // Encoding.UTF8 emits a BOM on every open; in append mode that
+            // sprinkles BOMs through the file. Use a no-BOM UTF-8 encoder.
+            _logFile = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)) { AutoFlush = true };
+            _logFile.WriteLine();
+            _logFile.WriteLine($"=== flashy-toast started {DateTime.Now:yyyy-MM-dd HH:mm:ss} pid={Environment.ProcessId} ===");
+        }
+        catch
+        {
+            // Logging is best-effort; if we can't open the log file we still
+            // run, just silently. Console.WriteLine below is also a no-op
+            // when no console is attached (the WinExe normal-run case).
+        }
+    }
+
     private static void Log(string message)
     {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+        var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+        try { _logFile?.WriteLine(line); } catch { }
+        Console.WriteLine(line);
     }
+
+    private const int ATTACH_PARENT_PROCESS = -1;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachConsole(int dwProcessId);
 }

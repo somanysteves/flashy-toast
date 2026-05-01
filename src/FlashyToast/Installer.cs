@@ -36,6 +36,7 @@ internal static class Installer
 
         Console.WriteLine($"Installed: {shortcutPath}");
         Console.WriteLine($"Target:    {exePath}");
+        Console.WriteLine($"Log file:  {Program.LogFilePath()}");
         Console.WriteLine("Will run at next login. Run with --uninstall to remove.");
         return 0;
     }

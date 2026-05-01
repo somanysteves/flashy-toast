@@ -24,8 +24,22 @@ That downloads the exe to `%LOCALAPPDATA%\flashy-toast\`, drops a shortcut in
 your Startup folder so it auto-runs at login, and starts it now.
 
 First run pops a Windows Settings prompt asking to allow notification access —
-grant it. After that the console window logs each toast it sees and what it
-flashed.
+grant it. After that flashy-toast runs silently in the background; nothing
+is shown on screen.
+
+## Logs
+
+Each toast and what it flashed is written to:
+
+```
+%LOCALAPPDATA%\flashy-toast\flashy-toast.log
+```
+
+To watch it live:
+
+```powershell
+Get-Content -Wait "$env:LOCALAPPDATA\flashy-toast\flashy-toast.log"
+```
 
 ## Uninstall
 
