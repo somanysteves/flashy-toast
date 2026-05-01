@@ -35,7 +35,67 @@ internal sealed class AudioSessionMonitor : IDisposable
     // count nested activations — a PID is "active" as a single boolean.
     private readonly ConcurrentDictionary<uint, DateTime> _activeSince = new();
 
+    // WASAPI's RegisterSessionNotification / RegisterAudioSessionNotification
+    // need an STA thread with a message pump to deliver callbacks; called from
+    // an MTA thread (the default for async/threadpool) they silently no-op.
+    // So all COM init, session binding, and release happens on a dedicated
+    // pumped STA worker, mirroring TitleChangeMonitor's pattern. WM_QUIT
+    // posted from Dispose() unwinds cleanly.
+    private Thread? _thread;
+    private uint _threadId;
+    private volatile bool _running;
+    private ManualResetEventSlim? _ready;
+    private Exception? _initError;
+
     public void Start()
+    {
+        if (_running) return;
+        _running = true;
+        _ready = new ManualResetEventSlim(false);
+
+        _thread = new Thread(WorkerLoop)
+        {
+            IsBackground = true,
+            Name = "flashy-toast audio-monitor",
+        };
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+        _ready.Wait();
+
+        if (_initError != null) throw _initError;
+    }
+
+    private void WorkerLoop()
+    {
+        _threadId = GetCurrentThreadId();
+
+        try
+        {
+            InitCom();
+        }
+        catch (Exception ex)
+        {
+            _initError = ex;
+            _ready!.Set();
+            return;
+        }
+
+        _ready!.Set();
+
+        // Pump until WM_QUIT arrives via Dispose(). COM callbacks
+        // (IAudioSessionEvents / IAudioSessionNotification) are dispatched
+        // through this loop.
+        while (GetMessage(out var msg, IntPtr.Zero, 0, 0) > 0)
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+
+        // Release COM objects on the same apartment that created them.
+        Cleanup();
+    }
+
+    private void InitCom()
     {
         var clsid = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
         var type = Type.GetTypeFromCLSID(clsid)
@@ -82,6 +142,32 @@ internal sealed class AudioSessionMonitor : IDisposable
         }
     }
 
+    private void Cleanup()
+    {
+        try
+        {
+            if (_manager != null && _notifier != null)
+            {
+                _manager.UnregisterSessionNotification(_notifier);
+            }
+        }
+        catch { }
+
+        lock (_lock)
+        {
+            foreach (var w in _watchers)
+            {
+                try { w.Session.UnregisterAudioSessionNotification(w); } catch { }
+                try { Marshal.ReleaseComObject(w.Session); } catch { }
+            }
+            _watchers.Clear();
+        }
+
+        if (_manager != null) { try { Marshal.ReleaseComObject(_manager); } catch { } _manager = null; }
+        if (_device != null) { try { Marshal.ReleaseComObject(_device); } catch { } _device = null; }
+        if (_enumerator != null) { try { Marshal.ReleaseComObject(_enumerator); } catch { } _enumerator = null; }
+    }
+
     internal void BindSession(IAudioSessionControl session)
     {
         try
@@ -126,31 +212,46 @@ internal sealed class AudioSessionMonitor : IDisposable
 
     public void Dispose()
     {
-        try
+        if (!_running) return;
+        _running = false;
+        if (_threadId != 0)
         {
-            if (_manager != null && _notifier != null)
-            {
-                _manager.UnregisterSessionNotification(_notifier);
-            }
+            PostThreadMessage(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         }
-        catch { }
-
-        lock (_lock)
-        {
-            foreach (var w in _watchers)
-            {
-                try { w.Session.UnregisterAudioSessionNotification(w); } catch { }
-                try { Marshal.ReleaseComObject(w.Session); } catch { }
-            }
-            _watchers.Clear();
-        }
-
-        if (_manager != null) { try { Marshal.ReleaseComObject(_manager); } catch { } _manager = null; }
-        if (_device != null) { try { Marshal.ReleaseComObject(_device); } catch { } _device = null; }
-        if (_enumerator != null) { try { Marshal.ReleaseComObject(_enumerator); } catch { } _enumerator = null; }
+        _thread?.Join(TimeSpan.FromSeconds(2));
     }
 
     private const uint CLSCTX_ALL = 0x17;
+    private const uint WM_QUIT = 0x0012;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG
+    {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public int x;
+        public int y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG msg, IntPtr hwnd, uint msgFilterMin, uint msgFilterMax);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TranslateMessage(ref MSG msg);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessage(ref MSG msg);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
 
     internal enum EDataFlow { eRender = 0, eCapture = 1, eAll = 2 }
     internal enum ERole { eConsole = 0, eMultimedia = 1, eCommunications = 2 }
