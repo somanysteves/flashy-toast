@@ -22,6 +22,21 @@ internal sealed class Flasher
         // desktops have hidden via SW_HIDE; those return false here.
         if (IsWindowVisible(hwnd)) return Flash.SkippedVisible;
 
+        return FlashWithDebounce(hwnd);
+    }
+
+    // Like TryFlash but skips only when the window IS the foreground window.
+    // Used for terminal triggers (Alacritty) where the window is always
+    // WS_VISIBLE but the user may have switched away.
+    public Flash TryFlashUnlessForeground(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return Flash.NoTarget;
+        if (GetForegroundWindow() == hwnd) return Flash.SkippedVisible;
+        return FlashWithDebounce(hwnd);
+    }
+
+    private Flash FlashWithDebounce(IntPtr hwnd)
+    {
         var now = DateTime.UtcNow;
         lock (_lock)
         {
@@ -64,4 +79,7 @@ internal sealed class Flasher
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowVisible(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
 }

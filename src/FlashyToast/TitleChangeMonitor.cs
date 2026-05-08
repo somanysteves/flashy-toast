@@ -20,6 +20,12 @@ internal sealed class TitleChangeMonitor : IDisposable
     // of any specific PID/HWND.
     private readonly ConcurrentDictionary<string, byte> _everChangedTitle =
         new(StringComparer.OrdinalIgnoreCase);
+
+    // Fired on the monitor's own thread whenever a top-level window title
+    // changes. Arguments: (hwnd, processName, newTitle). Handlers must be
+    // fast and non-blocking; heavy work should be posted to a threadpool thread.
+    public event Action<IntPtr, string, string>? TitleChanged;
+
     private Thread? _thread;
     private uint _threadId;
     private IntPtr _hook;
@@ -109,6 +115,8 @@ internal sealed class TitleChangeMonitor : IDisposable
                 if (!string.IsNullOrEmpty(p.ProcessName))
                 {
                     _everChangedTitle.TryAdd(p.ProcessName, 0);
+                    var newTitle = GetTitle(hwnd);
+                    TitleChanged?.Invoke(hwnd, p.ProcessName, newTitle);
                 }
             }
             catch
@@ -117,6 +125,21 @@ internal sealed class TitleChangeMonitor : IDisposable
             }
         }
     }
+
+    private static string GetTitle(IntPtr hwnd)
+    {
+        var len = GetWindowTextLength(hwnd);
+        if (len <= 0) return string.Empty;
+        var sb = new System.Text.StringBuilder(len + 1);
+        GetWindowText(hwnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int GetWindowTextLength(IntPtr hwnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint lpdwProcessId);

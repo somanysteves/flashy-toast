@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using Windows.UI.Notifications;
 using Windows.UI.Notifications.Management;
@@ -28,6 +29,13 @@ internal static class Program
     // access to _flasher's debounce dict and _seen.
     private static readonly object _handleLock = new();
     private static readonly HashSet<uint> _seen = new();
+
+    // Terminal title-change trigger: tracks whether each window was last seen
+    // in a "busy" state (title starts with a braille spinner char U+2800–U+28FF,
+    // e.g. "⠋ Claude Code"). Flashes on the busy→idle transition only.
+    // No process-name filter — the braille pattern is specific enough to Claude
+    // Code's TUI that any terminal hosting it is covered automatically.
+    private static readonly ConcurrentDictionary<IntPtr, bool> _terminalWasBusy = new();
 
     private static async Task<int> Main(string[] args)
     {
@@ -109,6 +117,7 @@ internal static class Program
         _ = PollNotificationsAsync(listener);
         Log("notification polling started.");
 
+        _titles.TitleChanged += (hwnd, _, newTitle) => OnTerminalTitleChanged(hwnd, newTitle);
         _titles.Start();
 
         // Audio path: subscribe alongside the toast listener. On machines
@@ -310,6 +319,32 @@ internal static class Program
         var flash = _flasher.TryFlash(winner.Hwnd);
         Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
             $"short-sound hwnd=0x{winner.Hwnd.ToInt64():X} hidden={hidden.Count}/{hwnds.Count} title={Quote(winner.WindowTitle)} flash={flash}");
+    }
+
+    // Braille spinner chars used by Claude Code's TUI (U+2800–U+28FF block).
+    private static bool IsBrailleSpinner(string title)
+        => title.Length > 0 && title[0] >= '⠀' && title[0] <= '⣿';
+
+    private static void OnTerminalTitleChanged(IntPtr hwnd, string newTitle)
+    {
+        var wasBusy = _terminalWasBusy.TryGetValue(hwnd, out var b) && b;
+        var nowBusy = IsBrailleSpinner(newTitle);
+
+        // Skip windows that have never been in a spinner state — avoids logging
+        // every title change on the system.
+        if (!wasBusy && !nowBusy) return;
+
+        _terminalWasBusy[hwnd] = nowBusy;
+        Log($"terminal-title hwnd=0x{hwnd.ToInt64():X} wasBusy={wasBusy} nowBusy={nowBusy} title={Quote(newTitle)}");
+
+        if (wasBusy && !nowBusy && newTitle.Length > 0)
+            SafeRun(() => FlashTerminal(hwnd));
+    }
+
+    private static void FlashTerminal(IntPtr hwnd)
+    {
+        var result = _flasher.TryFlashUnlessForeground(hwnd);
+        Log($"terminal-idle hwnd=0x{hwnd.ToInt64():X} flash={result}");
     }
 
     private static void DumpCandidates()
