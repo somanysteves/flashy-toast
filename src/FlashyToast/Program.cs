@@ -24,7 +24,7 @@ internal static class Program
 
     private const string MutexName = @"Local\flashy-toast-singleton";
 
-    // NotificationChanged events fire on threadpool threads; serialize
+    // Poll results and audio events arrive on threadpool threads; serialize
     // access to _flasher's debounce dict and _seen.
     private static readonly object _handleLock = new();
     private static readonly HashSet<uint> _seen = new();
@@ -100,16 +100,14 @@ internal static class Program
             return 3;
         }
 
-        try
-        {
-            listener.NotificationChanged += OnNotificationChanged;
-            Log("subscribed to NotificationChanged.");
-        }
-        catch (Exception ex)
-        {
-            Log($"NotificationChanged subscription threw: {ex.GetType().Name}: {ex.Message} (HRESULT 0x{ex.HResult:X8})");
-            return 5;
-        }
+        // Polling instead of UserNotificationListener.NotificationChanged: the
+        // event subscription throws RPC_S_CALL_FAILED (0x800706BE, ~9s timeout)
+        // when called from an elevated process — Windows blocks COM callbacks
+        // crossing into a high-integrity process. Outbound GetNotificationsAsync
+        // calls work fine, so we poll. 750ms is fast enough that the user can't
+        // perceive a lag between toast and flash.
+        _ = PollNotificationsAsync(listener);
+        Log("notification polling started.");
 
         _titles.Start();
 
@@ -149,23 +147,24 @@ internal static class Program
         catch (Exception ex) { Log($"audio handler threw: {ex.GetType().Name}: {ex.Message}"); }
     }
 
-    private static void OnNotificationChanged(UserNotificationListener sender, UserNotificationChangedEventArgs args)
+    private static async Task PollNotificationsAsync(UserNotificationListener listener)
     {
-        if (args.ChangeKind != UserNotificationChangedKind.Added) return;
-
-        UserNotification? n = null;
-        try { n = sender.GetNotification(args.UserNotificationId); }
-        catch (Exception ex)
+        while (true)
         {
-            Log($"GetNotification({args.UserNotificationId}) threw: {ex.GetType().Name}: {ex.Message}");
-            return;
-        }
-        if (n is null) return;
-
-        lock (_handleLock)
-        {
-            if (!_seen.Add(n.Id)) return;
-            Handle(n);
+            await Task.Delay(750);
+            try
+            {
+                var notifications = await listener.GetNotificationsAsync(NotificationKinds.Toast);
+                lock (_handleLock)
+                {
+                    foreach (var n in notifications)
+                        if (_seen.Add(n.Id)) Handle(n);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"poll threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 
