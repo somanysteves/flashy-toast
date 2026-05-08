@@ -62,10 +62,12 @@ not a working branch.
    required-status-check setting). Don't rebase + force-push — we want
    the feature-branch commits preserved as-is, and force-push is on the
    explicit-approval list above for good reason.
-6. The user merges, using a merge commit (not squash, not rebase). The
-   feature branch's commits are intentionally part of `main`'s history.
-   Claude does NOT run `gh pr merge` or click merge on the user's behalf,
-   even after CI is green.
+6. Merge with a merge commit (not squash, not rebase). The feature
+   branch's commits are intentionally part of `main`'s history. Claude
+   may run `gh pr merge --merge` only when the user explicitly says so
+   in the current message ("merge it", "ship it", etc.) — never
+   unsolicited, never while CI is pending or red. A previous merge
+   approval does not carry forward to a future PR.
 
 `main` is branch-protected: the `build` check is a required status check,
 so merges (and direct pushes) need a green build on the head SHA. If a
