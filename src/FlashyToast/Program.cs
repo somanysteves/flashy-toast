@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using Windows.UI.Notifications;
 using Windows.UI.Notifications.Management;
@@ -8,20 +9,33 @@ internal static class Program
 {
     private static readonly Flasher _flasher = new();
     private static readonly TitleChangeMonitor _titles = new();
+    private static readonly AudioSessionMonitor _audio = new();
     private static StreamWriter? _logFile;
 
-    // How recent a title change must be (relative to toast observation) for
-    // us to trust it as the originating window. Event delivery is sub-second
-    // so a small window is fine, but tab-switch + toast-fire ordering can
-    // span a couple seconds on slow systems — keep some slack.
+    // How recent a title change must be (relative to toast/audio observation)
+    // for us to trust it as the originating window. Event delivery is
+    // sub-second so a small window is fine, but tab-switch + toast-fire
+    // ordering can span a couple seconds on slow systems — keep some slack.
     private static readonly TimeSpan TitleChangeWindow = TimeSpan.FromSeconds(5);
+
+    // Audio sessions shorter than this are treated as notification dings (used
+    // as fallback when the originating app is not a known title-changer).
+    // Calls/music/video stay Active far longer than this.
+    private static readonly TimeSpan ShortSoundMax = TimeSpan.FromMilliseconds(1500);
 
     private const string MutexName = @"Local\flashy-toast-singleton";
 
-    // NotificationChanged events fire on threadpool threads; serialize
+    // Poll results and audio events arrive on threadpool threads; serialize
     // access to _flasher's debounce dict and _seen.
     private static readonly object _handleLock = new();
     private static readonly HashSet<uint> _seen = new();
+
+    // Terminal title-change trigger: tracks whether each window was last seen
+    // in a "busy" state (title starts with a braille spinner char U+2800–U+28FF,
+    // e.g. "⠋ Claude Code"). Flashes on the busy→idle transition only.
+    // No process-name filter — the braille pattern is specific enough to Claude
+    // Code's TUI that any terminal hosting it is covered automatically.
+    private static readonly ConcurrentDictionary<IntPtr, bool> _terminalWasBusy = new();
 
     private static async Task<int> Main(string[] args)
     {
@@ -94,18 +108,34 @@ internal static class Program
             return 3;
         }
 
+        // Polling instead of UserNotificationListener.NotificationChanged: the
+        // event subscription throws RPC_S_CALL_FAILED (0x800706BE, ~9s timeout)
+        // when called from an elevated process — Windows blocks COM callbacks
+        // crossing into a high-integrity process. Outbound GetNotificationsAsync
+        // calls work fine, so we poll. 750ms is fast enough that the user can't
+        // perceive a lag between toast and flash.
+        _ = PollNotificationsAsync(listener);
+        Log("notification polling started.");
+
+        _titles.TitleChanged += (hwnd, _, newTitle) => OnTerminalTitleChanged(hwnd, newTitle);
+        _titles.Start();
+
+        // Audio path: subscribe alongside the toast listener. On machines
+        // where notification access is denied, we'd have already returned
+        // above; on machines where it's allowed, both signals fire and the
+        // Flasher's HWND-based debounce dedupes.
+        _audio.OnActivated += a => SafeRun(() => HandleAudioActive(a.Pid));
+        _audio.OnDeactivated += d => SafeRun(() => HandleAudioInactive(d.Pid, d.Duration));
         try
         {
-            listener.NotificationChanged += OnNotificationChanged;
-            Log("subscribed to NotificationChanged.");
+            _audio.Start();
+            Log("AudioSessionMonitor started.");
         }
         catch (Exception ex)
         {
-            Log($"NotificationChanged subscription threw: {ex.GetType().Name}: {ex.Message} (HRESULT 0x{ex.HResult:X8})");
-            return 5;
+            Log($"AudioSessionMonitor start failed: {ex.GetType().Name}: {ex.Message} — audio trigger disabled, toast path still active.");
         }
 
-        _titles.Start();
         try
         {
             // Run until process kill / logoff. We're a packaged background
@@ -115,27 +145,35 @@ internal static class Program
         finally
         {
             _titles.Stop();
+            _audio.Dispose();
         }
         return 0;
     }
 
-    private static void OnNotificationChanged(UserNotificationListener sender, UserNotificationChangedEventArgs args)
+    private static void SafeRun(Action a)
     {
-        if (args.ChangeKind != UserNotificationChangedKind.Added) return;
+        try { a(); }
+        catch (Exception ex) { Log($"audio handler threw: {ex.GetType().Name}: {ex.Message}"); }
+    }
 
-        UserNotification? n = null;
-        try { n = sender.GetNotification(args.UserNotificationId); }
-        catch (Exception ex)
+    private static async Task PollNotificationsAsync(UserNotificationListener listener)
+    {
+        while (true)
         {
-            Log($"GetNotification({args.UserNotificationId}) threw: {ex.GetType().Name}: {ex.Message}");
-            return;
-        }
-        if (n is null) return;
-
-        lock (_handleLock)
-        {
-            if (!_seen.Add(n.Id)) return;
-            Handle(n);
+            await Task.Delay(750);
+            try
+            {
+                var notifications = await listener.GetNotificationsAsync(NotificationKinds.Toast);
+                lock (_handleLock)
+                {
+                    foreach (var n in notifications)
+                        if (_seen.Add(n.Id)) Handle(n);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"poll threw: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 
@@ -161,9 +199,13 @@ internal static class Program
             return;
         }
 
+        // Pick among ALL matches, not just hidden ones. If the winner turns
+        // out to be visible (the originating window is on the user's current
+        // workspace), Flasher's IsWindowVisible check skips the flash. We
+        // must NOT filter to hidden first — that would let a runner-up hidden
+        // window get flashed when the real originating window is visible.
         var (winner, pickReason) = PickWinner(matches);
-        var debounceKey = aumid;
-        var result = _flasher.TryFlash(winner.Hwnd, debounceKey);
+        var result = _flasher.TryFlash(winner.Hwnd);
         Log($"toast id={n.Id} aumid={aumid} display={Quote(displayName)} → " +
             $"hwnd=0x{winner.Hwnd.ToInt64():X} stage={winner.Stage} pick={pickReason} " +
             $"proc={winner.ProcessName} title={Quote(winner.WindowTitle)} flash={result} " +
@@ -174,14 +216,40 @@ internal static class Program
     {
         if (matches.Count == 1) return (matches[0], "only-match");
 
-        // Among multi-window candidates (Chrome being the canonical case),
-        // the originating tab/window typically just changed its title in
-        // response to the underlying notification. Pick the most-recent
-        // change within TitleChangeWindow.
+        var picked = PickByTitleChange(matches);
+        if (picked is { } p) return p;
+        return (matches[0], "z-order");
+    }
+
+    // Titles like "(3) Mail - Outlook" or "• Slack" indicate a tab with an
+    // unread count. Matches the most recently changed such window within
+    // TitleChangeWindow — the audio and title-update arrive together.
+    private static readonly System.Text.RegularExpressions.Regex NotificationTitleRx =
+        new(@"^\(\d+\)|^• ", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static (WindowResolver.Resolution Winner, string Reason)? PickByNotificationTitle(IReadOnlyList<WindowResolver.Resolution> candidates)
+    {
         var cutoff = DateTime.UtcNow - TitleChangeWindow;
         WindowResolver.Resolution? best = null;
         DateTime bestTime = DateTime.MinValue;
-        foreach (var m in matches)
+        foreach (var m in candidates)
+        {
+            var t = _titles.LastChange(m.Hwnd);
+            if (t is null || t.Value < cutoff) continue;
+            if (!NotificationTitleRx.IsMatch(m.WindowTitle)) continue;
+            if (t.Value > bestTime) { bestTime = t.Value; best = m; }
+        }
+        if (best is null) return null;
+        var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
+        return (best, $"notify-title({ageMs}ms)");
+    }
+
+    private static (WindowResolver.Resolution Winner, string Reason)? PickByTitleChange(IReadOnlyList<WindowResolver.Resolution> candidates)
+    {
+        var cutoff = DateTime.UtcNow - TitleChangeWindow;
+        WindowResolver.Resolution? best = null;
+        DateTime bestTime = DateTime.MinValue;
+        foreach (var m in candidates)
         {
             var t = _titles.LastChange(m.Hwnd);
             if (t is null || t.Value < cutoff) continue;
@@ -191,12 +259,102 @@ internal static class Program
                 best = m;
             }
         }
-        if (best is not null)
+        if (best is null) return null;
+        var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
+        return (best, $"title-change({ageMs}ms)");
+    }
+
+    private static void HandleAudioActive(uint pid)
+    {
+        var procName = WindowResolver.ProcessNameForPid(pid);
+        Log($"audio-active pid={pid} proc={Quote(procName ?? "")}");
+        if (string.IsNullOrEmpty(procName)) return;
+
+        var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) hwnds = WindowResolver.ResolveByProcessName(procName);
+        if (hwnds.Count == 0) return;
+
+        var pick = PickByNotificationTitle(hwnds);
+        if (pick is null)
         {
-            var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
-            return (best, $"title-change({ageMs}ms)");
+            Log($"audio-active pid={pid} proc={procName} matches={hwnds.Count} → no notification title, wait for inactive");
+            return;
         }
-        return (matches[0], "z-order");
+
+        var result = _flasher.TryFlash(pick.Value.Winner.Hwnd);
+        Log($"audio-active pid={pid} proc={procName} → " +
+            $"hwnd=0x{pick.Value.Winner.Hwnd.ToInt64():X} pick={pick.Value.Reason} " +
+            $"title={Quote(pick.Value.Winner.WindowTitle)} flash={result}");
+    }
+
+    private static void HandleAudioInactive(uint pid, TimeSpan duration)
+    {
+        var procName = WindowResolver.ProcessNameForPid(pid);
+        Log($"audio-inactive pid={pid} proc={Quote(procName ?? "")} dur={(int)duration.TotalMilliseconds}ms");
+        if (string.IsNullOrEmpty(procName)) return;
+
+        var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) hwnds = WindowResolver.ResolveByProcessName(procName);
+        if (hwnds.Count == 0) return;
+
+        // Precise path: a window whose title recently changed to a notification
+        // pattern (e.g. "(3) Mail - Outlook", "• Slack"). Fires regardless of
+        // sound duration — duration gating only applies to the fallback path.
+        var pick = PickByNotificationTitle(hwnds);
+        if (pick is not null)
+        {
+            var result = _flasher.TryFlash(pick.Value.Winner.Hwnd);
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
+                $"hwnd=0x{pick.Value.Winner.Hwnd.ToInt64():X} pick={pick.Value.Reason} " +
+                $"title={Quote(pick.Value.Winner.WindowTitle)} flash={result}");
+            return;
+        }
+
+        // Fallback: short-sound heuristic. Anything longer than ShortSoundMax
+        // is assumed to be media/call audio, not a notification ding.
+        if (duration > ShortSoundMax)
+        {
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → too long for short-sound, skip");
+            return;
+        }
+
+        var hidden = hwnds.Where(r => !WindowResolver.IsHwndVisible(r.Hwnd)).ToList();
+        if (hidden.Count == 0)
+        {
+            Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → short-sound but all windows visible, skip");
+            return;
+        }
+
+        var winner = hidden[0];
+        var flash = _flasher.TryFlash(winner.Hwnd);
+        Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
+            $"short-sound hwnd=0x{winner.Hwnd.ToInt64():X} hidden={hidden.Count}/{hwnds.Count} title={Quote(winner.WindowTitle)} flash={flash}");
+    }
+
+    // Braille spinner chars used by Claude Code's TUI (U+2800–U+28FF block).
+    private static bool IsBrailleSpinner(string title)
+        => title.Length > 0 && title[0] >= '⠀' && title[0] <= '⣿';
+
+    private static void OnTerminalTitleChanged(IntPtr hwnd, string newTitle)
+    {
+        var wasBusy = _terminalWasBusy.TryGetValue(hwnd, out var b) && b;
+        var nowBusy = IsBrailleSpinner(newTitle);
+
+        // Skip windows that have never been in a spinner state — avoids logging
+        // every title change on the system.
+        if (!wasBusy && !nowBusy) return;
+
+        _terminalWasBusy[hwnd] = nowBusy;
+        Log($"terminal-title hwnd=0x{hwnd.ToInt64():X} wasBusy={wasBusy} nowBusy={nowBusy} title={Quote(newTitle)}");
+
+        if (wasBusy && !nowBusy && newTitle.Length > 0)
+            SafeRun(() => FlashTerminal(hwnd));
+    }
+
+    private static void FlashTerminal(IntPtr hwnd)
+    {
+        var result = _flasher.TryFlashUnlessForeground(hwnd);
+        Log($"terminal-idle hwnd=0x{hwnd.ToInt64():X} flash={result}");
     }
 
     private static void DumpCandidates()

@@ -11,6 +11,21 @@ namespace FlashyToast;
 internal sealed class TitleChangeMonitor : IDisposable
 {
     private readonly ConcurrentDictionary<IntPtr, DateTime> _lastChange = new();
+    // Set of process names (case-insensitive) we've ever observed changing
+    // their title bar during this daemon's lifetime. Used by the audio path
+    // to classify "this app updates its titlebar on notification" → require
+    // a recent title change, vs. "this app never updates its title" → fall
+    // back to short-sound duration. Monotonic: once added, never removed,
+    // because the classification is a property of the app's behavior, not
+    // of any specific PID/HWND.
+    private readonly ConcurrentDictionary<string, byte> _everChangedTitle =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Fired on the monitor's own thread whenever a top-level window title
+    // changes. Arguments: (hwnd, processName, newTitle). Handlers must be
+    // fast and non-blocking; heavy work should be posted to a threadpool thread.
+    public event Action<IntPtr, string, string>? TitleChanged;
+
     private Thread? _thread;
     private uint _threadId;
     private IntPtr _hook;
@@ -70,6 +85,9 @@ internal sealed class TitleChangeMonitor : IDisposable
     public DateTime? LastChange(IntPtr hwnd)
         => _lastChange.TryGetValue(hwnd, out var t) ? t : null;
 
+    public bool HasEverChangedTitle(string processName)
+        => !string.IsNullOrEmpty(processName) && _everChangedTitle.ContainsKey(processName);
+
     private void OnWinEvent(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
         int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
     {
@@ -83,7 +101,48 @@ internal sealed class TitleChangeMonitor : IDisposable
         if (GetAncestor(hwnd, GA_ROOT) != hwnd) return;
 
         _lastChange[hwnd] = DateTime.UtcNow;
+
+        // Record this process as a known title-changer. Resolved per-event
+        // (no PID cache) — at human-rate title-change frequency the cost of
+        // Process.GetProcessById is negligible, and skipping the cache
+        // sidesteps PID-reuse correctness issues across the daemon's
+        // potentially multi-day lifetime.
+        if (GetWindowThreadProcessId(hwnd, out var pid) != 0 && pid != 0)
+        {
+            try
+            {
+                using var p = System.Diagnostics.Process.GetProcessById((int)pid);
+                if (!string.IsNullOrEmpty(p.ProcessName))
+                {
+                    _everChangedTitle.TryAdd(p.ProcessName, 0);
+                    var newTitle = GetTitle(hwnd);
+                    TitleChanged?.Invoke(hwnd, p.ProcessName, newTitle);
+                }
+            }
+            catch
+            {
+                // Process may have exited between event and lookup; ignore.
+            }
+        }
     }
+
+    private static string GetTitle(IntPtr hwnd)
+    {
+        var len = GetWindowTextLength(hwnd);
+        if (len <= 0) return string.Empty;
+        var sb = new System.Text.StringBuilder(len + 1);
+        GetWindowText(hwnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int GetWindowTextLength(IntPtr hwnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint lpdwProcessId);
 
     private const uint EVENT_OBJECT_NAMECHANGE = 0x800C;
     private const uint WINEVENT_OUTOFCONTEXT = 0x0000;
