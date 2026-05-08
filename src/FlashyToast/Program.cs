@@ -221,12 +221,31 @@ internal static class Program
         return (matches[0], "z-order");
     }
 
+    // Titles like "(3) Mail - Outlook" or "• Slack" indicate a tab with an
+    // unread count. Matches the most recently changed such window within
+    // TitleChangeWindow — the audio and title-update arrive together.
+    private static readonly System.Text.RegularExpressions.Regex NotificationTitleRx =
+        new(@"^\(\d+\)|^• ", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static (WindowResolver.Resolution Winner, string Reason)? PickByNotificationTitle(IReadOnlyList<WindowResolver.Resolution> candidates)
+    {
+        var cutoff = DateTime.UtcNow - TitleChangeWindow;
+        WindowResolver.Resolution? best = null;
+        DateTime bestTime = DateTime.MinValue;
+        foreach (var m in candidates)
+        {
+            var t = _titles.LastChange(m.Hwnd);
+            if (t is null || t.Value < cutoff) continue;
+            if (!NotificationTitleRx.IsMatch(m.WindowTitle)) continue;
+            if (t.Value > bestTime) { bestTime = t.Value; best = m; }
+        }
+        if (best is null) return null;
+        var ageMs = (int)(DateTime.UtcNow - bestTime).TotalMilliseconds;
+        return (best, $"notify-title({ageMs}ms)");
+    }
+
     private static (WindowResolver.Resolution Winner, string Reason)? PickByTitleChange(IReadOnlyList<WindowResolver.Resolution> candidates)
     {
-        // Among multi-window candidates (Chrome being the canonical case),
-        // the originating tab/window typically just changed its title in
-        // response to the underlying notification. Pick the most-recent
-        // change within TitleChangeWindow.
         var cutoff = DateTime.UtcNow - TitleChangeWindow;
         WindowResolver.Resolution? best = null;
         DateTime bestTime = DateTime.MinValue;
@@ -247,22 +266,18 @@ internal static class Program
 
     private static void HandleAudioActive(uint pid)
     {
-        // Title-changer apps fire fast: try to pick a winner based on a recent
-        // title change right now (audio came up, title likely just flipped).
-        // Non-title-changers wait for HandleAudioInactive — we need duration
-        // to discriminate notification dings from music/calls.
         var procName = WindowResolver.ProcessNameForPid(pid);
+        Log($"audio-active pid={pid} proc={Quote(procName ?? "")}");
         if (string.IsNullOrEmpty(procName)) return;
-        if (!_titles.HasEverChangedTitle(procName)) return;
 
         var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) hwnds = WindowResolver.ResolveByProcessName(procName);
         if (hwnds.Count == 0) return;
 
-        // Pick among all windows; Flasher will skip if winner is visible.
-        var pick = PickByTitleChange(hwnds);
+        var pick = PickByNotificationTitle(hwnds);
         if (pick is null)
         {
-            Log($"audio-active pid={pid} proc={procName} matches={hwnds.Count} → no recent title change, wait for inactive");
+            Log($"audio-active pid={pid} proc={procName} matches={hwnds.Count} → no notification title, wait for inactive");
             return;
         }
 
@@ -275,21 +290,19 @@ internal static class Program
     private static void HandleAudioInactive(uint pid, TimeSpan duration)
     {
         var procName = WindowResolver.ProcessNameForPid(pid);
+        Log($"audio-inactive pid={pid} proc={Quote(procName ?? "")} dur={(int)duration.TotalMilliseconds}ms");
         if (string.IsNullOrEmpty(procName)) return;
 
         var hwnds = WindowResolver.ResolveByPid(pid);
+        if (hwnds.Count == 0) hwnds = WindowResolver.ResolveByProcessName(procName);
         if (hwnds.Count == 0) return;
 
-        if (_titles.HasEverChangedTitle(procName))
+        // Precise path: a window whose title recently changed to a notification
+        // pattern (e.g. "(3) Mail - Outlook", "• Slack"). Fires regardless of
+        // sound duration — duration gating only applies to the fallback path.
+        var pick = PickByNotificationTitle(hwnds);
+        if (pick is not null)
         {
-            // Title changed AFTER Activated? Re-check now. HWND-debounce in
-            // Flasher prevents double-flash if Activated already fired.
-            var pick = PickByTitleChange(hwnds);
-            if (pick is null)
-            {
-                Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → titlechanger, no recent title change, skip");
-                return;
-            }
             var result = _flasher.TryFlash(pick.Value.Winner.Hwnd);
             Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → " +
                 $"hwnd=0x{pick.Value.Winner.Hwnd.ToInt64():X} pick={pick.Value.Reason} " +
@@ -297,17 +310,14 @@ internal static class Program
             return;
         }
 
-        // Non-titlechanger: short-sound heuristic. Anything longer than
-        // ShortSoundMax is assumed to be media/call audio, not a notification.
+        // Fallback: short-sound heuristic. Anything longer than ShortSoundMax
+        // is assumed to be media/call audio, not a notification ding.
         if (duration > ShortSoundMax)
         {
             Log($"audio-inactive pid={pid} proc={procName} dur={(int)duration.TotalMilliseconds}ms → too long for short-sound, skip");
             return;
         }
 
-        // No title-change signal — we don't know which window is originating.
-        // Filter to hidden so we don't false-flash a window the user can see;
-        // pick z-order top among hidden.
         var hidden = hwnds.Where(r => !WindowResolver.IsHwndVisible(r.Hwnd)).ToList();
         if (hidden.Count == 0)
         {

@@ -78,6 +78,24 @@ internal static class WindowResolver
 
     public static string ProcessNameForPid(uint pid) => TryGetProcessName(pid);
 
+    // Fallback for multi-process apps (e.g. Chrome/Edge renderer subprocesses)
+    // where the audio session belongs to a process with no top-level window.
+    // Returns all windows whose owning process has the given name, in Z-order.
+    public static IReadOnlyList<Resolution> ResolveByProcessName(string procName)
+    {
+        if (string.IsNullOrEmpty(procName)) return Array.Empty<Resolution>();
+        var ownPid = (uint)Environment.ProcessId;
+        var list = new List<Resolution>();
+        foreach (var hwnd in EnumerateTopLevelWindows())
+        {
+            if (!TryGetWindowPid(hwnd, out var pid) || pid == ownPid) continue;
+            var name = TryGetProcessName(pid);
+            if (string.Equals(name, procName, StringComparison.OrdinalIgnoreCase))
+                list.Add(new Resolution(hwnd, "procname", GetWindowTitle(hwnd), name));
+        }
+        return list;
+    }
+
     // Public visibility check used by Flasher and decision paths. bug.n hides
     // windows via SW_HIDE which clears WS_VISIBLE; IsWindowVisible returns
     // false for those, true for windows the user can currently see.
