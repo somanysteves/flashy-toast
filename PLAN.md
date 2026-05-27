@@ -166,21 +166,26 @@ flashy-toast/
    2s debounce; skips foreground windows and own PID. Verified end-to-end:
    Chrome toast on a different bug.n workspace produces `flash=Flashed` and
    bug.n's shell-hook handler marks the correct workspace urgent.
-4. ✅ **Auto-start.** Replaced the Startup-folder shortcut approach with a
-   packaged-desktop `windows.startupTask` extension (`Enabled="true"`, no
-   consent dialog per MSIX docs). Single-instance mutex
-   (`Local\flashy-toast-singleton`) preserved for safety. User must launch
-   the packaged app once from the Start menu before Windows arms auto-start
-   (OS-level requirement, not a code thing).
-5. ✅ **MSIX + events.** Self-signed MSIX package gives the exe packaged
-   identity, which unlocks the foreground `NotificationChanged` event
-   (verified empirically — subscription succeeds with no `0x80070490`).
-   Polling loop deleted; latency drops from ≤ 2 s to sub-second. Build
-   pipeline (`build.ps1`) generates a self-signed cert if needed, publishes
-   the exe, packs via `MakeAppx`, and signs with `signtool`.
-6. **Polish (later).** Tray icon, pause toggle, log rotation, real
-   code-signing cert (replace self-signed → CA-signed without manifest
-   changes), Microsoft Store submission for free auto-update.
+4. ✅ **Auto-start.** Scheduled Task with logon trigger and `RunLevel=Highest`
+   (auto-elevated, no UAC at logon). The exe's embedded manifest declares
+   `requireAdministrator` so a double-click also runs elevated via UAC.
+   `install.ps1` provisions the task. Single-instance mutex
+   (`Local\flashy-toast-singleton`) preserved for safety.
+5. ⚠️ **MSIX experiment, reverted.** A previous iteration packaged the exe as
+   a self-signed MSIX to get packaged identity for the foreground
+   `NotificationChanged` event. That worked when the process was unelevated,
+   but once we needed elevation to flash higher-IL windows the event
+   subscription started throwing `RPC_S_CALL_FAILED (0x800706BE)` — Windows
+   blocks COM callbacks crossing into a high-integrity process. We reverted
+   to polling at 750 ms (visually indistinguishable from event-driven for
+   notification cadence) and dropped MSIX entirely: it was buying us nothing
+   while costing PLM hang detection (`MoAppHang`), ACL repair churn, and
+   broken shell activation for `requireAdministrator` packaged apps. On
+   Win11 26200, `UserNotificationListener` works fine from an unpackaged
+   exe — `RequestAccessAsync` returns Allowed and `GetNotificationsAsync`
+   enumerates real toasts.
+6. **Polish (later).** Tray icon, pause toggle, log rotation, code-signing
+   cert for the exe to silence SmartScreen on fresh download.
 
 ### Milestone 2/3 gotcha: do NOT filter on `IsWindowVisible`
 
