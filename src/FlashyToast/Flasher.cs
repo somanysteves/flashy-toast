@@ -52,8 +52,8 @@ internal sealed class Flasher
             cbSize = (uint)Marshal.SizeOf<FLASHWINFO>(),
             hwnd = hwnd,
             dwFlags = FLASHW_ALL,
-            uCount = 6,
-            dwTimeout = 500,
+            uCount = 1,
+            dwTimeout = 0,
         };
         return FlashWindowEx(ref info) ? Flash.Flashed : Flash.PInvokeFailed;
     }
