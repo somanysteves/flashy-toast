@@ -14,25 +14,32 @@ invisible to bug.n.
 
 ## Install
 
-flashy-toast ships as a self-signed `.msix` package. Two-step install:
+flashy-toast ships as a single self-contained `.exe`. Two-step install:
 
-**1. Trust the signing cert (admin PowerShell, once per machine):**
-
-```powershell
-iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.cer -OutFile flashy-toast.cer
-Import-Certificate -FilePath flashy-toast.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-```
-
-**2. Install the package (normal-user PowerShell):**
+**1. Download the exe:**
 
 ```powershell
-iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.msix -OutFile flashy-toast.msix
-Add-AppxPackage flashy-toast.msix
+iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/flashy-toast.exe -OutFile flashy-toast.exe
+iwr https://github.com/somanysteves/flashy-toast/releases/latest/download/install.ps1 -OutFile install.ps1
 ```
 
-**3. Launch flashy-toast once from the Start menu** (search "flashy-toast"). Windows
-requires this one-time manual launch before auto-start kicks in. After that the
-app starts on every login automatically — no shortcut, no console, no UI.
+**2. Run the installer (elevated PowerShell):**
+
+```powershell
+.\install.ps1 -Source .\flashy-toast.exe
+```
+
+This copies the exe to `%LOCALAPPDATA%\Programs\flashy-toast\` and registers
+a Scheduled Task that runs it at every logon with highest privileges (no UAC
+prompt at logon). To start it immediately without rebooting:
+
+```powershell
+Start-ScheduledTask -TaskName flashy-toast
+```
+
+The exe itself declares `requireAdministrator` in its embedded manifest, so
+double-clicking it directly will also prompt UAC and run elevated — useful
+if you want to restart it manually mid-session.
 
 First run pops a Windows Settings prompt asking to allow notification access —
 grant it.
@@ -54,15 +61,10 @@ Get-Content -Wait "$env:LOCALAPPDATA\flashy-toast\flashy-toast.log"
 ## Uninstall
 
 ```powershell
-Get-AppxPackage -Name FlashyToast | Remove-AppxPackage
-Remove-Item "$env:LOCALAPPDATA\flashy-toast" -Recurse -Force -ErrorAction SilentlyContinue
+.\uninstall.ps1
 ```
 
-To also drop the trusted cert (admin):
-
-```powershell
-Get-ChildItem Cert:\LocalMachine\TrustedPeople | Where-Object Subject -eq 'CN=flashy-toast' | Remove-Item
-```
+Pass `-PurgeLogs` to also delete `%LOCALAPPDATA%\flashy-toast\`.
 
 ## Build from source
 
@@ -72,13 +74,14 @@ Requires the .NET 8 SDK.
 git clone https://github.com/somanysteves/flashy-toast
 cd flashy-toast
 ./build.ps1
+./install.ps1
 ```
 
-CI runs the same script (`.github/workflows/build.yml`, `.github/workflows/release.yml`).
+CI runs `build.ps1` (`.github/workflows/build.yml`, `.github/workflows/release.yml`).
 
 ## How it works
 
 See [PLAN.md](PLAN.md) for the design and the gotchas worth knowing about
 (why we don't filter on `IsWindowVisible`, how Chrome multi-window
-disambiguation works, why packaged identity is required for
+disambiguation works, why we poll instead of subscribing to
 `NotificationChanged`).
