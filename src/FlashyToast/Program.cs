@@ -31,10 +31,10 @@ internal static class Program
     private static readonly HashSet<uint> _seen = new();
 
     // Terminal title-change trigger: tracks whether each window was last seen
-    // in a "busy" state (title starts with a braille spinner char U+2800–U+28FF,
-    // e.g. "⠋ Claude Code"). Flashes on the busy→idle transition only.
-    // No process-name filter — the braille pattern is specific enough to Claude
-    // Code's TUI that any terminal hosting it is covered automatically.
+    // in a "busy" state (title starts with a Claude Code spinner glyph — see
+    // IsSpinner). Flashes on the busy→idle transition only. No process-name
+    // filter — the spinner glyph patterns are specific enough to Claude Code's
+    // TUI that any terminal hosting it is covered automatically.
     private static readonly ConcurrentDictionary<IntPtr, bool> _terminalWasBusy = new();
 
     private static async Task<int> Main(string[] args)
@@ -331,14 +331,30 @@ internal static class Program
             $"short-sound hwnd=0x{winner.Hwnd.ToInt64():X} hidden={hidden.Count}/{hwnds.Count} title={Quote(winner.WindowTitle)} flash={flash}");
     }
 
-    // Braille spinner chars used by Claude Code's TUI (U+2800–U+28FF block).
-    private static bool IsBrailleSpinner(string title)
-        => title.Length > 0 && title[0] >= '⠀' && title[0] <= '⣿';
+    // Spinner glyphs Claude Code's TUI puts at the start of the terminal title
+    // while it's working. Older builds used the braille block (U+2800–U+28FF,
+    // e.g. "⠋ Claude Code"); current builds use the half-circle spinner
+    // (U+25D0–U+25D3, "◐◑◒◓"). The idle/ready state uses "✳" (U+2733), which is
+    // outside both ranges, so a busy→idle transition is detected cleanly.
+    private static bool IsSpinner(string title)
+    {
+        // Elevated terminals transiently carry an "Administrator: " prefix that
+        // shoves the spinner off position 0. Strip it so a still-busy elevated
+        // window ("Administrator: ◑ …") isn't misread as idle, which would flash
+        // (mark urgent) while it's actually still working.
+        const string adminPrefix = "Administrator: ";
+        if (title.StartsWith(adminPrefix, StringComparison.Ordinal))
+            title = title.Substring(adminPrefix.Length);
+        if (title.Length == 0) return false;
+        char c = title[0];
+        return (c >= '⠀' && c <= '⣿')   // braille block  ⠀…⣿
+            || (c >= '◐' && c <= '◓');   // half-circle    ◐◑◒◓
+    }
 
     private static void OnTerminalTitleChanged(IntPtr hwnd, string newTitle)
     {
         var wasBusy = _terminalWasBusy.TryGetValue(hwnd, out var b) && b;
-        var nowBusy = IsBrailleSpinner(newTitle);
+        var nowBusy = IsSpinner(newTitle);
 
         // Skip windows that have never been in a spinner state — avoids logging
         // every title change on the system.
